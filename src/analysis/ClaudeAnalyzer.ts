@@ -137,53 +137,45 @@ CRITICAL RULES:
 - Reference actual data in reasoning (e.g., "1H RSI at 28", "Orderbook 0.87 bid/ask")`;
   }
 
-  private getCryptoComMCPTools() {
+  private getCryptoComMCPTools(): Anthropic.Tool[] { // Add explicit return type
     return [
       {
-        name: 'Crypto.com:get_ticker',
-        description: 'Get current market ticker data',
+        name: 'get_ticker',
+        description: 'Get latest price and volume for a crypto symbol',
         input_schema: {
-          type: 'object',
+          type: 'object' as const, // 👈 KEY FIX: Add "as const" here
           properties: {
-            instrument_name: { type: 'string' }
+            instrument_name: {
+              type: 'string',
+              description: 'Symbol name (e.g. BTCUSD-PERP)'
+            }
           },
           required: ['instrument_name']
         }
       },
       {
-        name: 'Crypto.com:get_book',
-        description: 'Get orderbook depth',
+        name: 'get_orderbook',
+        description: 'Get current bids and asks depth',
         input_schema: {
-          type: 'object',
+          type: 'object' as const, // 👈 KEY FIX: Add "as const" here
           properties: {
             instrument_name: { type: 'string' },
-            depth: { type: 'integer' }
+            depth: { type: 'number', description: 'Number of levels (default 10)' }
           },
           required: ['instrument_name']
         }
       },
       {
-        name: 'Crypto.com:get_trades',
-        description: 'Get recent trades',
+        name: 'get_candles',
+        description: 'Get historical price candles (OHLCV)',
         input_schema: {
-          type: 'object',
+          type: 'object' as const, // 👈 KEY FIX: Add "as const" here
           properties: {
             instrument_name: { type: 'string' },
-            count: { type: 'integer' }
+            timeframe: { type: 'string', description: '1m, 5m, 15m, 1h, 4h, 1d' },
+            count: { type: 'number', description: 'Number of candles' }
           },
           required: ['instrument_name']
-        }
-      },
-      {
-        name: 'Crypto.com:get_candlestick',
-        description: 'Get candlestick data',
-        input_schema: {
-          type: 'object',
-          properties: {
-            instrument_name: { type: 'string' },
-            timeframe: { type: 'string' }
-          },
-          required: ['instrument_name', 'timeframe']
         }
       }
     ];
