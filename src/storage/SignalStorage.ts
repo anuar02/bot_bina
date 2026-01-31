@@ -1,8 +1,14 @@
 import type { StoredSignal, WatchCondition } from '../analysis/types.js';
+import type { TelegramNotifier } from '../notifications/TelegramNotifier.js';
 import { randomUUID } from 'crypto';
 
 export class SignalStorage {
   private signals: Map<string, StoredSignal> = new Map();
+  private telegram: TelegramNotifier;
+
+  constructor(telegram: TelegramNotifier) {
+    this.telegram = telegram;
+  }
 
   storeSignal(symbol: string, opportunity: any): string {
     const id = randomUUID();
@@ -15,15 +21,14 @@ export class SignalStorage {
       watchConditions: opportunity.watchConditions || [],
       active: true
     };
-    
+
     this.signals.set(id, signal);
-    console.log(`[Storage] Stored signal ${id} for ${symbol}`);
     return id;
   }
 
   getActiveSignals(symbol: string): StoredSignal[] {
     return Array.from(this.signals.values())
-      .filter(s => s.symbol === symbol && s.active);
+        .filter(s => s.symbol === symbol && s.active);
   }
 
   incrementFollowup(signalId: string): number {
@@ -39,13 +44,12 @@ export class SignalStorage {
     const signal = this.signals.get(signalId);
     if (signal) {
       signal.active = false;
-      console.log(`[Storage] Deactivated signal ${signalId}`);
     }
   }
 
   checkWatchConditions(symbol: string, currentPrice: number, volumeSpike: boolean): StoredSignal[] {
     const triggered: StoredSignal[] = [];
-    
+
     for (const signal of this.signals.values()) {
       if (signal.symbol !== symbol || !signal.active || signal.watchConditions.length === 0) {
         continue;
@@ -67,9 +71,8 @@ export class SignalStorage {
         }
 
         if (isTriggered) {
-          console.log(`[Storage] Watch condition triggered for signal ${signal.id}: ${condition.trigger} ${condition.value}`);
           triggered.push(signal);
-          break; // Only trigger once per signal
+          break;
         }
       }
     }

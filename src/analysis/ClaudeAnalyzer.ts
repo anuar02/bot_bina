@@ -9,83 +9,109 @@ export class ClaudeAnalyzer {
   }
 
   async analyzeOpportunity(
-    symbol: string,
-    currentPrice: number,
-    triggerReason: string,
-    followupContext?: string
+      symbol: string,
+      currentPrice: number,
+      triggerReason: string,
+      followupContext?: string,
+      onToolUsage?: (tools: Array<{ name: string; input: any }>) => void
   ): Promise<SignalOpportunity | null> {
     try {
       const prompt = this.buildPrompt(symbol, currentPrice, triggerReason, followupContext);
-      
-      console.log(`[Claude] Analyzing ${symbol} at $${currentPrice}...`);
-      
+
       const response = await this.client.messages.create({
         model: 'claude-sonnet-4-5-20250929',
-        max_tokens: 2000,
+        max_tokens: 4000,
         temperature: 0.2,
-        messages: [{ role: 'user', content: prompt }]
+        messages: [{ role: 'user', content: prompt }],
+        tools: this.getCryptoComMCPTools()
       });
 
-      const content = response.content[0];
-      if (content.type !== 'text') return null;
+      // ============================================
+      // 🔍 EXTRACT TOOL USAGE
+      // ============================================
+      const toolsUsed = this.extractToolUsage(response.content);
 
-      // Extract JSON from response
-      const jsonMatch = content.text.match(/\{[\s\S]*\}/);
+      // Notify caller about tool usage
+      if (onToolUsage) {
+        onToolUsage(toolsUsed);
+      }
+
+      // Find text response
+      const textContent = response.content.find(c => c.type === 'text');
+      if (!textContent || textContent.type !== 'text') {
+        return null;
+      }
+
+      // Extract JSON
+      const jsonMatch = textContent.text.match(/\{[\s\S]*\}/);
       if (!jsonMatch) {
-        console.warn('[Claude] No JSON found in response');
         return null;
       }
 
       const opportunity: SignalOpportunity = JSON.parse(jsonMatch[0]);
-      
-      console.log(`[Claude] ✅ ${opportunity.opportunity} - Probability: ${opportunity.probability}%`);
-      
-      return opportunity;
+
+      // Add metadata about tool usage
+      return {
+        ...opportunity,
+        _metadata: {
+          toolsUsed: toolsUsed.map(t => t.name),
+          toolCount: toolsUsed.length,
+          usedRealData: toolsUsed.length > 0,
+          timestamp: Date.now()
+        }
+      };
 
     } catch (error) {
-      console.error('[Claude] Analysis failed:', error);
-      return null;
+      throw error; // Let caller handle errors
     }
   }
 
-  private buildPrompt(
-    symbol: string,
-    currentPrice: number,
-    triggerReason: string,
-    followupContext?: string
-  ): string {
-    const basePrompt = `You are an elite crypto trader analyzing ${symbol}.
+  private extractToolUsage(content: any[]): Array<{ name: string; input: any }> {
+    return content
+        .filter(block => block.type === 'tool_use')
+        .map(block => ({
+          name: block.name,
+          input: block.input
+        }));
+  }
 
-${followupContext ? `FOLLOW-UP CONTEXT:\n${followupContext}\n` : ''}
+  private buildPrompt(
+      symbol: string,
+      currentPrice: number,
+      triggerReason: string,
+      followupContext?: string
+  ): string {
+    return `You are an elite crypto trader analyzing ${symbol}.
+
+${followupContext ? `FOLLOW-UP CONTEXT:\n${followupContext}\n\n` : ''}
 CURRENT SITUATION:
 - Price: $${currentPrice}
 - Trigger: ${triggerReason}
 
 USE YOUR MCP TOOLS TO INVESTIGATE:
 
-1. Crypto.com connector (use these tools):
+1. Crypto.com connector (MANDATORY - use these tools):
    - get_ticker: Current market data
    - get_book: Orderbook depth (check walls, imbalance)
-   - get_trades: Recent trades (last 50-100) to read tape
-   - get_candlestick: Multi-timeframe candles (1D, 4H, 1H, 15m)
+   - get_trades: Recent trades (last 100) to read tape
+   - get_candlestick: Multi-timeframe candles (1D, 4h, 1h, 15m)
 
 2. web_search (if macro matters):
    - Search "Bitcoin BTC market news today" for sentiment
    - Search "Bitcoin Fear Greed Index" for sentiment gauge
-   - Check for upcoming FOMC or major economic events
 
 ANALYZE QUICKLY:
-- Order flow (is there buying or selling pressure?)
-- Technical structure (trend, support/resistance)
-- Leverage positioning (funding rate, overleveraged side)
-- Macro backdrop (any critical events coming?)
+- Order flow (buying vs selling pressure from tape)
+- Technical structure (trend, support/resistance from candles)
+- Leverage positioning (funding rate, orderbook imbalance)
+- Macro backdrop (any critical events?)
 
 RESPOND WITH JSON ONLY:
 
 {
   "opportunity": "LONG" | "SHORT" | "WAIT" | "WATCH",
   "probability": <0-100>,
-  "reasoning": "<2-3 sentences max explaining why>",
+  "reasoning": "<2-3 sentences citing specific data points>",
   
   // If LONG or SHORT:
   "entry": <price>,
@@ -94,25 +120,72 @@ RESPOND WITH JSON ONLY:
   "riskReward": <ratio>,
   "timeValidity": "4h" | "12h" | "24h",
   
-  // If WATCH or unclear:
+  // If WATCH:
   "watchConditions": [
     {
       "trigger": "price_below" | "price_above" | "volume_spike",
-      "value": <specific number>,
+      "value": <number>,
       "then": "<what opportunity emerges>"
     }
   ]
 }
 
 CRITICAL RULES:
-- Only signal LONG/SHORT if probability ≥65% AND risk/reward ≥2.5
-- If uncertain, return "WATCH" with specific conditions to monitor
-- Be concise (2-3 sentences max for reasoning)
-- Use MCP tools to get real data - don't guess
-- Specify exact price levels for watch conditions
+- MUST use MCP tools before responding (don't guess data)
+- Only LONG/SHORT if probability ≥65% AND R:R ≥2.5
+- If uncertain, return WATCH with specific price triggers
+- Reference actual data in reasoning (e.g., "1H RSI at 28", "Orderbook 0.87 bid/ask")`;
+  }
 
-Begin analysis now using your tools.`;
-
-    return basePrompt;
+  private getCryptoComMCPTools() {
+    return [
+      {
+        name: 'Crypto.com:get_ticker',
+        description: 'Get current market ticker data',
+        input_schema: {
+          type: 'object',
+          properties: {
+            instrument_name: { type: 'string' }
+          },
+          required: ['instrument_name']
+        }
+      },
+      {
+        name: 'Crypto.com:get_book',
+        description: 'Get orderbook depth',
+        input_schema: {
+          type: 'object',
+          properties: {
+            instrument_name: { type: 'string' },
+            depth: { type: 'integer' }
+          },
+          required: ['instrument_name']
+        }
+      },
+      {
+        name: 'Crypto.com:get_trades',
+        description: 'Get recent trades',
+        input_schema: {
+          type: 'object',
+          properties: {
+            instrument_name: { type: 'string' },
+            count: { type: 'integer' }
+          },
+          required: ['instrument_name']
+        }
+      },
+      {
+        name: 'Crypto.com:get_candlestick',
+        description: 'Get candlestick data',
+        input_schema: {
+          type: 'object',
+          properties: {
+            instrument_name: { type: 'string' },
+            timeframe: { type: 'string' }
+          },
+          required: ['instrument_name', 'timeframe']
+        }
+      }
+    ];
   }
 }

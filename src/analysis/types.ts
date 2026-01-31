@@ -9,15 +9,22 @@ export interface WatchCondition {
 }
 
 export interface SignalOpportunity {
-  opportunity: OpportunityType;
+  opportunity: 'LONG' | 'SHORT' | 'WAIT' | 'WATCH';
   probability: number;
   reasoning: string;
   entry?: number;
   stopLoss?: number;
   targets?: number[];
   riskReward?: number;
-  watchConditions?: WatchCondition[];
   timeValidity?: '4h' | '12h' | '24h';
+  watchConditions?: WatchCondition[];
+
+  _metadata?: {
+    toolsUsed: string[];
+    toolCount: number;
+    usedRealData: boolean;
+    timestamp: number;
+  };
 }
 
 export interface StoredSignal {

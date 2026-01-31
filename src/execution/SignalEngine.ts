@@ -11,25 +11,19 @@ export class SignalEngine {
   private telegram: TelegramNotifier;
   private storage: SignalStorage;
   private symbols: string[];
+  private lastAnalysisTime: Map<string, number> = new Map();
+  private readonly ANALYSIS_COOLDOWN_MS = 5 * 60 * 1000;
 
   constructor() {
     this.analyzer = new ClaudeAnalyzer(config.ANTHROPIC_API_KEY);
     this.dataCollector = new DataCollector();
     this.telegram = new TelegramNotifier(config.TELEGRAM_BOT_TOKEN, config.TELEGRAM_CHAT_ID);
-    this.storage = new SignalStorage();
+    this.storage = new SignalStorage(this.telegram); // Pass telegram to storage
     this.symbols = config.SYMBOLS.split(',').map(s => s.trim());
   }
 
   async start(): Promise<void> {
-    console.log('🤖 Smart Signal System Starting...\n');
-    console.log(`📊 Monitoring: ${this.symbols.join(', ')}`);
-    console.log(`⏱️  Check interval: ${config.CHECK_INTERVAL_SECONDS}s`);
-    console.log(`🎯 Min probability: ${config.MIN_PROBABILITY}%`);
-    console.log(`📈 Min R:R: ${config.MIN_RISK_REWARD}\n`);
-
     await this.telegram.sendStartup(this.symbols);
-
-    // Start monitoring loop
     this.monitorMarkets();
   }
 
@@ -38,24 +32,20 @@ export class SignalEngine {
       for (const symbol of this.symbols) {
         try {
           await this.checkSymbol(symbol);
-        } catch (error) {
-          console.error(`[Engine] Error checking ${symbol}:`, error);
+        } catch (error: any) {
+          await this.telegram.sendError(symbol, error.message || 'Unknown error');
         }
       }
     };
 
-    // Initial check
     await check();
-
-    // Schedule regular checks
     setInterval(check, config.CHECK_INTERVAL_SECONDS * 1000);
   }
 
-  // 👇 THIS IS THE MAIN UPDATE
   private async checkSymbol(symbol: string): Promise<void> {
     const snapshot = await this.dataCollector.getMarketSnapshot(symbol);
 
-    // 1. Check Watch Conditions (Existing logic)
+    // Check watch conditions
     const triggeredSignals = this.storage.checkWatchConditions(
         symbol,
         snapshot.price,
@@ -66,19 +56,8 @@ export class SignalEngine {
       await this.handleTriggeredWatchCondition(symbol, signal, snapshot.price);
     }
 
-    // 2. Check Pre-filters (Volatility/Volume)
+    // Check if new analysis needed
     if (this.shouldAnalyze(snapshot)) {
-
-      // ✅ NEW: Retrieve price history for the sparkline
-      const history = this.dataCollector.getPriceHistory(symbol);
-
-      // ✅ NEW: Send visual alert to Telegram immediately
-      await this.telegram.sendTriggerAlert(symbol, history, {
-        volatility: (snapshot.volatility24h * 100).toFixed(2),
-        volumeChange: snapshot.volumeChange
-      });
-
-      // 3. Trigger Claude Analysis
       await this.analyzeNewOpportunity(symbol, snapshot);
     }
   }
@@ -87,49 +66,81 @@ export class SignalEngine {
     const highVolatility = snapshot.volatility24h >= config.PREFILTER_MIN_VOLATILITY;
     const volumeSpike = snapshot.volumeChange >= config.PREFILTER_MIN_VOLUME_SPIKE;
 
-    if (highVolatility || volumeSpike) {
-      const reasons = [];
-      if (highVolatility) reasons.push(`Volatility ${(snapshot.volatility24h * 100).toFixed(2)}%`);
-      if (volumeSpike) reasons.push(`Volume ${snapshot.volumeChange.toFixed(1)}x`);
-
-      console.log(`[Engine] 🔥 Pre-filter triggered for ${snapshot.symbol}: ${reasons.join(', ')}`);
-      return true;
-    }
-
-    return false;
+    return highVolatility || volumeSpike;
   }
 
   private async analyzeNewOpportunity(symbol: string, snapshot: any): Promise<void> {
-    const triggerReason = `Volatility ${(snapshot.volatility24h * 100).toFixed(2)}%, Volume ${snapshot.volumeChange.toFixed(1)}x`;
+    // Check cooldown
+    const lastAnalysis = this.lastAnalysisTime.get(symbol) || 0;
+    const timeSinceLastAnalysis = Date.now() - lastAnalysis;
 
-    // ... (rest of the method remains exactly the same) ...
-    const opportunity = await this.analyzer.analyzeOpportunity(
-        symbol,
-        snapshot.price,
-        triggerReason
-    );
-
-    if (!opportunity) {
-      console.log(`[Engine] Claude returned no opportunity for ${symbol}`);
+    if (timeSinceLastAnalysis < this.ANALYSIS_COOLDOWN_MS) {
+      const remainingMinutes = Math.ceil((this.ANALYSIS_COOLDOWN_MS - timeSinceLastAnalysis) / 60000);
+      await this.telegram.sendCooldown(symbol, remainingMinutes);
       return;
     }
 
-    if (opportunity.opportunity === 'LONG' || opportunity.opportunity === 'SHORT') {
-      if (opportunity.probability < config.MIN_PROBABILITY) {
-        console.log(`[Engine] ❌ Probability ${opportunity.probability}% below minimum ${config.MIN_PROBABILITY}%`);
-        return;
-      }
-
-      if (opportunity.riskReward && opportunity.riskReward < config.MIN_RISK_REWARD) {
-        console.log(`[Engine] ❌ R:R ${opportunity.riskReward} below minimum ${config.MIN_RISK_REWARD}`);
-        return;
-      }
+    // Build trigger reason
+    const reasons = [];
+    if (snapshot.volatility24h >= config.PREFILTER_MIN_VOLATILITY) {
+      reasons.push(`Volatility ${(snapshot.volatility24h * 100).toFixed(2)}%`);
     }
+    if (snapshot.volumeChange >= config.PREFILTER_MIN_VOLUME_SPIKE) {
+      reasons.push(`Volume ${snapshot.volumeChange.toFixed(1)}x`);
+    }
+    const triggerReason = reasons.join(', ');
 
-    const signalId = this.storage.storeSignal(symbol, opportunity);
-    await this.telegram.sendSignal(symbol, opportunity);
+    // Notify analysis start
+    await this.telegram.sendAnalysisStart(symbol, triggerReason);
+    await this.telegram.sendClaudeRequest(symbol, snapshot.price);
 
-    console.log(`[Engine] ✅ Signal sent for ${symbol} (ID: ${signalId})`);
+    // Set cooldown
+    this.lastAnalysisTime.set(symbol, Date.now());
+
+    try {
+      // Analyze with Claude
+      const opportunity = await this.analyzer.analyzeOpportunity(
+          symbol,
+          snapshot.price,
+          triggerReason,
+          undefined,
+          async (toolsUsed) => {
+            // Send tool usage to Telegram
+            await this.telegram.sendToolUsage(symbol, toolsUsed);
+          }
+      );
+
+      if (!opportunity) {
+        await this.telegram.sendNoOpportunity(symbol);
+        return;
+      }
+
+      // Validate signal
+      if (opportunity.opportunity === 'LONG' || opportunity.opportunity === 'SHORT') {
+        if (opportunity.probability < config.MIN_PROBABILITY) {
+          await this.telegram.sendRejection(
+              symbol,
+              `Probability ${opportunity.probability}% below minimum ${config.MIN_PROBABILITY}%`
+          );
+          return;
+        }
+
+        if (opportunity.riskReward && opportunity.riskReward < config.MIN_RISK_REWARD) {
+          await this.telegram.sendRejection(
+              symbol,
+              `R:R ${opportunity.riskReward.toFixed(1)} below minimum ${config.MIN_RISK_REWARD}`
+          );
+          return;
+        }
+      }
+
+      // Store and send signal
+      this.storage.storeSignal(symbol, opportunity);
+      await this.telegram.sendSignal(symbol, opportunity);
+
+    } catch (error: any) {
+      await this.telegram.sendError(symbol, `Claude analysis failed: ${error.message}`);
+    }
   }
 
   private async handleTriggeredWatchCondition(
@@ -137,48 +148,58 @@ export class SignalEngine {
       signal: any,
       currentPrice: number
   ): Promise<void> {
-    // ... (rest of the method remains exactly the same) ...
-
-    // (Existing implementation continues here)
     const followupCount = this.storage.incrementFollowup(signal.id);
 
     if (followupCount > config.MAX_FOLLOWUPS_PER_SIGNAL) {
-      console.log(`[Engine] Max follow-ups (${config.MAX_FOLLOWUPS_PER_SIGNAL}) reached for signal ${signal.id}`);
       this.storage.deactivateSignal(signal.id);
       return;
     }
 
-    console.log(`[Engine] 🎯 Watch condition triggered for ${symbol} (Follow-up ${followupCount}/${config.MAX_FOLLOWUPS_PER_SIGNAL})`);
-
+    // Find triggered condition
     const triggeredCondition = signal.watchConditions.find((cond: any) => {
       if (cond.trigger === 'price_below') return currentPrice < cond.value;
       if (cond.trigger === 'price_above') return currentPrice > cond.value;
       return false;
     });
 
-    const followupContext = triggeredCondition
-        ? `Previous analysis suggested watching when ${triggeredCondition.trigger} $${triggeredCondition.value}. That condition just triggered. Previous assessment: ${signal.opportunity.reasoning}`
-        : `Watch condition triggered for previous signal.`;
-
-    const opportunity = await this.analyzer.analyzeOpportunity(
-        symbol,
-        currentPrice,
-        'Watch condition triggered',
-        followupContext
-    );
-
-    if (!opportunity) return;
-
-    const triggerInfo = triggeredCondition
-        ? `${triggeredCondition.trigger} $${triggeredCondition.value}`
+    const conditionText = triggeredCondition
+        ? `${triggeredCondition.trigger.replace('_', ' ')} $${triggeredCondition.value}`
         : 'Watch condition met';
 
-    await this.telegram.sendFollowup(symbol, triggerInfo, opportunity);
+    await this.telegram.sendWatchTriggered(symbol, conditionText);
+    await this.telegram.sendClaudeRequest(symbol, currentPrice);
 
-    if (opportunity.watchConditions && opportunity.watchConditions.length > 0) {
-      signal.watchConditions = opportunity.watchConditions;
-    } else {
-      this.storage.deactivateSignal(signal.id);
+    const followupContext = triggeredCondition
+        ? `Previous analysis suggested watching when ${triggeredCondition.trigger} $${triggeredCondition.value}. That condition just triggered. Previous assessment: ${signal.opportunity.reasoning}`
+        : `Watch condition triggered.`;
+
+    try {
+      const opportunity = await this.analyzer.analyzeOpportunity(
+          symbol,
+          currentPrice,
+          'Watch condition triggered',
+          followupContext,
+          async (toolsUsed) => {
+            await this.telegram.sendToolUsage(symbol, toolsUsed);
+          }
+      );
+
+      if (!opportunity) {
+        await this.telegram.sendNoOpportunity(symbol);
+        return;
+      }
+
+      await this.telegram.sendFollowup(symbol, conditionText, opportunity);
+
+      // Update or deactivate signal
+      if (opportunity.watchConditions && opportunity.watchConditions.length > 0) {
+        signal.watchConditions = opportunity.watchConditions;
+      } else {
+        this.storage.deactivateSignal(signal.id);
+      }
+
+    } catch (error: any) {
+      await this.telegram.sendError(symbol, `Follow-up analysis failed: ${error.message}`);
     }
   }
 }
